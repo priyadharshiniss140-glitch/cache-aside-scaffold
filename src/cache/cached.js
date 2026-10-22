@@ -1,24 +1,44 @@
 import { redis } from "../redis.js";
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
- * cached(key, ttl, fetcher) — YOUR JOB.
+ * Cache-aside helper with a short NX/EX lock to prevent cache stampedes.
  *
- * Turn this into a cache-aside helper WITH stampede protection.
- * Right now it does NO caching — it just runs the fetcher every time,
- * so the endpoints work but are slow and unprotected.
- *
- * Implement, in order:
- *   1. redis.get(key) — on a HIT, JSON.parse and return it (no DB).
- *   2. On a MISS, take a stampede lock so only ONE request does the work:
- *        const got = await redis.set("lock:" + key, "1", "NX", "EX", 5);
- *      - if got: run fetcher(), SET the key with an EX ttl, DEL the lock, return.
- *      - else (someone else holds the lock): sleep ~50ms, re-read the cache,
- *        return that (or fall back to fetcher() if still empty).
- *
- * The worked reference is the cached() helper from the lesson — study it,
- * then write your own here.
+ * @template T
+ * @param {string} key Redis cache key.
+ * @param {number} ttl Cache TTL in seconds.
+ * @param {() => Promise<T>} fetcher Function called on a cache miss.
+ * @returns {Promise<T>}
  */
 export async function cached(key, ttl, fetcher) {
-  // TODO: replace this naive passthrough with cache-aside + SET ... NX EX lock.
-  return fetcher();
+  const hit = await redis.get(key);
+  if (hit !== null) return JSON.parse(hit);
+
+  const lockKey = "lock:" + key;
+
+  while (true) {
+    // Only one request can acquire this miss lock; lock expiry prevents stale locks.
+    const gotLock = await redis.set(lockKey, "1", "NX", "EX", 5);
+
+    if (gotLock === "OK") {
+      try {
+        // Double-check after acquiring the lock in case the previous holder filled cache.
+        const secondHit = await redis.get(key);
+        if (secondHit !== null) return JSON.parse(secondHit);
+
+        const value = await fetcher();
+        await redis.set(key, JSON.stringify(value), "EX", ttl);
+        return value;
+      } finally {
+        await redis.del(lockKey);
+      }
+    }
+
+    // Another request is populating the cache. Poll instead of starting duplicate DB work.
+    await sleep(50);
+    const populated = await redis.get(key);
+    if (populated !== null) return JSON.parse(populated);
+    // If the lock holder failed or its five-second lock expired, try to acquire it.
+  }
 }
