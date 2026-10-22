@@ -1,4 +1,3 @@
-import "dotenv/config";
 import Redis from "ioredis";
 
 // Uses REDIS_URL from .env (see .env.example), falling back to local Redis.
