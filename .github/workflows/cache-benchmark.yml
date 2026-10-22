@@ -69,10 +69,16 @@ jobs:
           PORT=3000 SLOW_MS=40 REDIS_URL="$REDIS_URL" node src/server.js > /tmp/cache-after.log 2>&1 &
           SERVER_PID=$!
           trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          HEALTHY=false
           for attempt in $(seq 1 30); do
-            if curl --silent --fail http://localhost:3000/health >/dev/null; then break; fi
+            if curl --silent --fail http://localhost:3000/health >/dev/null; then HEALTHY=true; break; fi
             sleep 1
           done
+          if [ "$HEALTHY" != true ]; then
+            echo "Cached server failed to start; server log follows:"
+            cat /tmp/cache-after.log
+            exit 1
+          fi
           curl --fail --silent http://localhost:3000/health
           AUTHOR_ID="$AUTHOR_ID" API=http://localhost:3000 npm run verify
           BEFORE_NAME="$(curl --fail --silent "http://localhost:3000/users/$AUTHOR_ID" | node --input-type=module -e 'let s=""; for await (const c of process.stdin) s += c; process.stdout.write(JSON.parse(s).name)')"
