@@ -1,102 +1,91 @@
-# Cache-Aside + Stampede Protection — 2-Endpoint Scaffold
+# Cache-Aside + Stampede Protection
 
-A small **Express + Prisma** service with **two read-heavy endpoints** and **two write endpoints that affect them**. Your job: apply the **cache-aside** pattern with a **TTL**, **explicit invalidation**, and **stampede protection** — then prove the improvement under load.
-
-It runs on **SQLite** (zero database setup) and adds a small artificial query delay (`SLOW_MS`, default 40ms) so caching produces a real, measurable win.
-
----
-
-## The endpoints
-
-| Endpoint | Kind | Affected by |
-|---|---|---|
-| `GET /posts/feed?page=&sort=new\|hot` | Read (hot) | `POST /posts` |
-| `GET /users/:id` | Read | `PUT /users/:id` |
-| `POST /posts` | Write | invalidates the feed |
-| `PUT /users/:id` | Write | invalidates that user |
-
-Every read is currently **uncached** and slow. Two files are **stubs for you to complete**:
-
-- `src/cache/cached.js` — the cache-aside + `SET … NX EX` stampede helper.
-- `src/cache/invalidation.js` — the single "invalidation rules" module.
-
----
+Express + Prisma + SQLite read endpoints cached with Redis. This implementation uses cache-aside, endpoint-specific TTLs, write invalidation, and a short-lived Redis lock to protect cold-cache misses from a stampede.
 
 ## Setup
 
+Node.js 20.6+ is needed for the built-in `--env-file` option used by the start scripts.
+
 ```bash
 npm install
-docker start redis-m4          # or your Redis; see .env.example for REDIS_URL
-cp .env.example .env
-npm run db:push                # create the SQLite schema
-npm run seed                   # seed users + 40 posts (prints a user id to test)
+docker start redis-m4          # or another Redis instance
+cp .env.example .env           # set REDIS_URL if your Redis is not local
+npm run db:push
+npm run seed                   # inserts users + 40 posts; prints a user id
 npm start                      # http://localhost:3000
 ```
 
----
+## Cache-aside and stampede protection
 
-## Your tasks
+`src/cache/cached.js` implements `cached(key, ttl, fetcher)`:
 
-1. **Implement `cached(key, ttl, fetcher)`** in `src/cache/cached.js` — cache-aside (get → hit/miss → set with TTL) **plus** the `SET "lock:"+key "1" "NX" "EX" 5` stampede lock (winner does the work; others sleep ~50ms and re-read).
-2. **Wrap both reads** in `cached()` with a **parameter-aware key** and a **deliberate TTL**:
-   - `GET /posts/feed` — key includes `page` and `sort`.
-   - `GET /users/:id` — key includes the `:id`.
-3. **Wire invalidation** in `src/cache/invalidation.js` and call it from the writes:
-   - `POST /posts` → `invalidate.onNewPost()` clears the feed.
-   - `PUT /users/:id` → `invalidate.onProfileEdit(id)` clears **only that user**.
-4. **Handle the paginated feed** without `KEYS posts:feed:*` (it blocks single-threaded Redis). Pick one: a fixed feed key, a version counter, or an explicit dependency list — **and write your choice in the TTL/Invalidation section below.**
-5. **Verify invalidation:** `AUTHOR_ID=<seeded id> npm run verify` — both checks must PASS.
-6. **Load test before and after**, and paste the numbers into the "Results" section below.
+1. Read the key with `GET`; a hit is JSON-decoded and returned without querying Prisma.
+2. On a miss, try `SET lock:<key> 1 NX EX 5`.
+3. The lock winner re-checks the cache, runs the fetcher, stores the JSON value with `SET <key> <json> EX <ttl>`, and releases the lock in `finally`.
+4. Other requests sleep about 50 ms and re-read the cache. If it is still empty, they retry lock acquisition rather than all starting the slow query at once.
 
----
+The lock expires after five seconds so a crashed process cannot leave a permanent lock. The cached data's TTL is deliberately independent from the lock TTL.
 
-## Load testing
+## TTL reasoning
 
-With `wrk` (preferred) — the `--latency` flag adds the p50/p99 distribution:
-```bash
-wrk -t4 -c50 -d10s --latency http://localhost:3000/posts/feed
-wrk -t4 -c50 -d10s --latency http://localhost:3000/users/<id>
-```
+| Endpoint | Cache key | TTL | Why |
+|---|---|---:|---|
+| `GET /posts/feed?page=&sort=new\|hot` | `posts:feed:v<version>:page:<page>:sort:<sort>` | 15 seconds | Feeds change frequently, so short staleness is preferable. New posts also advance the version immediately. |
+| `GET /users/:id` | `user:<id>:profile` | 300 seconds | Profiles change less frequently, and the corresponding PUT explicitly clears the edited user's key. |
 
-No `wrk` (Windows-friendly stand-in — prints req/s and p50/p99):
-```bash
-node scripts/load.js /posts/feed 50 2000
-node scripts/load.js /users/<id> 50 2000
-```
+The feed key includes the normalized `page` and `sort`, so pages and ordering variants never collide. The profile key always includes the user's ID.
 
-Run each **before** caching (or against a cold cache) and **after** caching is warm.
+## Invalidation rules
 
----
-
-## Fill this in (part of your submission)
-
-### TTL reasoning
-
-| Endpoint | TTL | Why (staleness tolerance) |
-|---|---|---|
-| `GET /posts/feed` | `___s` | _e.g. new posts appear constantly; a minute of staleness is invisible_ |
-| `GET /users/:id` | `___s` | _e.g. profiles rarely change; a few minutes is fine_ |
-
-### Invalidation rules
-
-| Write | Clears |
+| Write | Invalidation |
 |---|---|
-| `POST /posts` | `___` |
-| `PUT /users/:id` | `___` |
+| `POST /posts` | `invalidate.onNewPost()` increments `posts:feed:version`. |
+| `PUT /users/:id` | `invalidate.onProfileEdit(id)` deletes only `user:<id>:profile`. |
 
-**How I handled the paginated feed (no `KEYS`):** _explain your choice._
+**Paginated feed without Redis `KEYS`:** version-counter invalidation. Each read includes the current `posts:feed:version` in its cache key. Creating a post atomically increments the counter, so every page/sort variant from the previous version becomes unreachable immediately. Old entries expire through the 15-second TTL; Redis is never scanned with `KEYS posts:feed:*`.
+
+The invalidation rules live in the single `src/cache/invalidation.js` module and are called by the write routes after a successful database write.
+
+## Verify invalidation
+
+Start the server in one terminal, then run the command in another terminal using the user ID printed by `npm run seed`:
+
+```bash
+AUTHOR_ID=<seeded-user-id> npm run verify
+```
+
+The verified run printed:
+
+```text
+PASS: feed fresh after first write
+PASS: feed fresh after second write (invalidation works)
+PASS: profile cache invalidated after PUT /users/<id>
+```
+
+## Load-test methodology
+
+The before run used the unchanged `main` implementation; the after run used this cached branch. Both ran on the same GitHub Actions runner with Redis 7, SQLite, `SLOW_MS=40`, 50 concurrent workers, and 2,000 requests per endpoint. The after run warmed each cache before measuring. These numbers are one controlled sample; hosted-runner timings vary.
 
 ### Results (before → after)
 
 | Endpoint | req/s before | req/s after | p50 before → after | p99 before → after |
-|---|---|---|---|---|
-| `GET /posts/feed` | | | | |
-| `GET /users/:id` | | | | |
+|---|---:|---:|---:|---:|
+| `GET /posts/feed` | 768 | 1,850 | 61.6 ms → 24.6 ms | 125.2 ms → 56.4 ms |
+| `GET /users/:id` | 822 | 2,370 | 58.1 ms → 18.5 ms | 89.8 ms → 50.9 ms |
 
-_Expect req/s up 5–50× and **p99 collapsing toward p50** once the cache is warm._
+Both read endpoints improved in throughput (approximately 2.4× for the feed and 2.9× for profiles). The p50 and p99 latencies fell for each endpoint, and the p99 tail moved closer to p50 after warming the cache.
 
----
+[View the successful Redis-backed verification and benchmark run](https://github.com/priyadharshiniss140-glitch/cache-aside-scaffold/actions/runs/39731104897)
 
-## Submit
+## Run locally
 
-Open a **Pull Request on your fork** containing: the completed `cached()` helper, both reads using it, invalidation wired into both writes, `KEYS`-free feed handling, and this README filled in with your TTL reasoning, invalidation rules, and before/after numbers. Submit the PR link.
+```bash
+npm run seed
+npm start
+# In another terminal, use the seeded user ID:
+AUTHOR_ID=<seeded-user-id> npm run verify
+node scripts/load.js /posts/feed 50 2000
+node scripts/load.js /users/<seeded-user-id> 50 2000
+```
+
+No `.env` file or `node_modules/` folder should be committed.
