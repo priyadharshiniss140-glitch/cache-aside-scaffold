@@ -1,29 +1,20 @@
 import { redis } from "../redis.js";
 
-/**
- * invalidation rules — ONE source of truth. YOUR JOB.
- *
- * Every write that changes a cached read must DEL the key(s) it affects.
- * Keeping all the rules here (not scattered across controllers) is what
- * stops invalidation from drifting as the app grows.
- *
- * Wire these up so that:
- *   - creating a post  clears the cached feed
- *   - editing a user   clears THAT user's cached profile (only that one)
- *
- * NOTE on the feed: if your feed key includes params (page, sort), a single
- * `redis.del("posts:feed")` won't cover every page. Decide how to handle it
- * and write your reasoning in the README. DO NOT use `redis.keys("posts:feed:*")`
- * in production — KEYS blocks single-threaded Redis. Use one of:
- *   - a fixed, un-paginated feed key (simplest for this scaffold), or
- *   - a version counter in the key (INCR on write), or
- *   - an explicit dependency list of live feed keys.
- */
+// Bumping this version invalidates every page/sort variant without Redis KEYS.
+export const FEED_VERSION_KEY = "posts:feed:version";
+
+export async function getFeedVersion() {
+  return (await redis.get(FEED_VERSION_KEY)) ?? "0";
+}
+
 export const invalidate = {
+  // A versioned key invalidates all pages and sort orders in O(1).
   onNewPost: async () => {
-    // TODO: DEL the cached feed key(s).
+    await redis.incr(FEED_VERSION_KEY);
   },
+
+  // Profile invalidation is precise: only this user's cached profile is removed.
   onProfileEdit: async (userId) => {
-    // TODO: DEL only this user's cached profile key.
+    await redis.del(`user:${userId}:profile`);
   },
 };

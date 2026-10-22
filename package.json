@@ -4,8 +4,8 @@
   "description": "2-endpoint Express + Prisma scaffold for applying cache-aside + stampede protection with Redis.",
   "type": "module",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "dev": "node --env-file=.env --watch src/server.js",
     "db:push": "prisma db push",
     "seed": "node prisma/seed.js",
     "verify": "node scripts/verify-invalidation.js",
